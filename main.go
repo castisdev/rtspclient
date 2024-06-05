@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
@@ -27,12 +28,13 @@ type config struct {
 	nEnd          int
 	readTimeout   time.Duration
 	writeTimeout  time.Duration
+	delayTimeout  time.Duration
 	startInterval time.Duration
 	count         int
 }
 
-func play(url, transport, id string) error {
-	err := playInternal(url, transport, id)
+func play(url, transport, id string, delayTimeout time.Duration) error {
+	err := playInternal(url, transport, id, delayTimeout)
 	if err != nil {
 		log.Println(err)
 		os.Exit(1)
@@ -40,7 +42,39 @@ func play(url, transport, id string) error {
 	return err
 }
 
-func playInternal(url, transport, id string) error {
+type DelayChecker struct {
+	mu           sync.Mutex
+	lastTS       uint32
+	lastT        time.Time
+	checkedTS    uint32
+	delayTimeout time.Duration
+}
+
+func (dc *DelayChecker) Check(pkt *rtp.Packet) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	if dc.lastTS == 0 {
+		dc.lastTS = pkt.Timestamp
+		dc.lastT = time.Now()
+		dc.checkedTS = pkt.Timestamp
+		return
+	}
+
+	if pkt.Timestamp-dc.checkedTS > 90000 {
+		dc.checkedTS = pkt.Timestamp
+		now := time.Now()
+		diffT := now.Sub(dc.lastT).Milliseconds()
+		diffTS := (pkt.Timestamp - dc.lastTS) / 90
+		if diffT-int64(diffTS) > dc.delayTimeout.Milliseconds() {
+			log.Printf("delayed RTP packet: %vms", diffT-int64(diffTS))
+			dc.lastT = now
+			dc.lastTS = pkt.Timestamp
+		}
+	}
+}
+
+func playInternal(url, transport, id string, delayTimeout time.Duration) error {
 	tr := gortsplib.TransportUDP
 	if transport == "TCP" {
 		tr = gortsplib.TransportTCP
@@ -74,8 +108,9 @@ func playInternal(url, transport, id string) error {
 	}
 	log.Printf("[%s] success to setup", id)
 
+	dc := &DelayChecker{delayTimeout: delayTimeout}
 	c.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
-		// log.Printf("RTP packet from media %v\n", medi)
+		dc.Check(pkt)
 	})
 
 	c.OnPacketRTCPAny(func(medi *description.Media, pkt rtcp.Packet) {
@@ -111,6 +146,7 @@ func main() {
 	flag.IntVar(&cfg.nEnd, "end", 10001, "url replace {NUM} to start-end")
 	flag.DurationVar(&cfg.readTimeout, "read-timeout", 2*time.Second, "read timeout")
 	flag.DurationVar(&cfg.writeTimeout, "write-timeout", 2*time.Second, "write timeout")
+	flag.DurationVar(&cfg.delayTimeout, "delay-timeout", 1*time.Second, "delay timeout")
 	flag.DurationVar(&cfg.startInterval, "start-interval", 10*time.Millisecond, "start session interval")
 	flag.IntVar(&cfg.count, "count", 1, "play session count")
 
@@ -138,7 +174,10 @@ func main() {
 		g, _ := errgroup.WithContext(context.Background())
 		for i := 0; i < cfg.count; i++ {
 			g.Go(func() error {
-				err := play(cfg.url, cfg.transport, cfg.url+":"+strconv.Itoa(i))
+				err := play(cfg.url,
+					cfg.transport,
+					cfg.url+":"+strconv.Itoa(i),
+					cfg.delayTimeout)
 				if err != nil {
 					log.Println(err)
 					os.Exit(1)
@@ -158,7 +197,7 @@ func main() {
 	for i := cfg.nStart; i <= cfg.nEnd; i++ {
 		u := strings.ReplaceAll(cfg.url, "{NUM}", strconv.Itoa(i))
 		g.Go(func() error {
-			err := play(u, cfg.transport, u)
+			err := play(u, cfg.transport, u, cfg.delayTimeout)
 			if err != nil {
 				log.Println(err)
 				os.Exit(1)
